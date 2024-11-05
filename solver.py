@@ -1,7 +1,7 @@
 import os
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import Lock, Value
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -36,17 +36,16 @@ def calculate_score(secret, word):
     return score
 
 def parallel(size, target):
-    with ThreadPoolExecutor() as executor:
-        num_threads = executor._max_workers
+    with ProcessPoolExecutor() as executor:
+        num_threads = os.cpu_count()
         N = size//num_threads
         carry = size%num_threads
 
-        lock = Lock()
         futures = []
         for i in range(num_threads):
             nloc = N+1 if i < carry else N
             start = i*N + min(i, carry)
-            futures.append(executor.submit(target, start, nloc, lock))
+            futures.append(executor.submit(target, start, nloc))
 
         for future in futures:
             future.result()
@@ -137,16 +136,18 @@ def guess_word(scores):
         prediction = predict(scores)
         
 def test(scores, percentage=0.2):
-    #testset = select(scores, lambda x, y: np.random.rand() < percentage)
-    testset = scores
-    guessed = 0
-    attempts_mean = 0
-    def guess(start, length, lock):
-        nonlocal guessed, attempts_mean
+    testset = [key for key in scores.keys() if np.random.rand() < percentage]
+
+    lock = Lock()
+    guessed = Value('i', 0)
+    attempts_mean = Value('i', 0)
+
+    global guess
+    def guess(start, length):
         local_guessed = 0
         local_attempts = 0
         for i in range(start, start+length):
-            secret = list(testset.keys())[i]
+            secret = testset[i]
             filtered = scores.copy()
             prediction = most_probable(filtered)
             attempt = 1
@@ -163,11 +164,11 @@ def test(scores, percentage=0.2):
                 local_attempts += attempt
 
         with lock:
-            guessed += local_guessed
-            attempts_mean += local_attempts
+            guessed.value += local_guessed
+            attempts_mean.value += local_attempts
     
     parallel(len(testset), guess)
-    print(f"Guess percentage: {guessed/len(testset)*100:.2f}% - Attempts mean: {attempts_mean/len(testset):.2f}")
+    print(f"Guess percentage: {guessed.value/len(testset)*100:.2f}% - Attempts mean: {attempts_mean.value/len(testset):.2f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
