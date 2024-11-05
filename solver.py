@@ -1,5 +1,7 @@
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -32,6 +34,22 @@ def calculate_score(secret, word):
         if mask == '1' or mask == '2':
             score += 1/5.0
     return score
+
+def parallel(size, target):
+    with ThreadPoolExecutor() as executor:
+        num_threads = executor._max_workers
+        N = size//num_threads
+        carry = size%num_threads
+
+        lock = Lock()
+        futures = []
+        for i in range(num_threads):
+            nloc = N+1 if i < carry else N
+            start = i*N + min(i, carry)
+            futures.append(executor.submit(target, start, nloc, lock))
+
+        for future in futures:
+            future.result()
 
 def compute_scores(words):
     scores = dict()
@@ -84,40 +102,71 @@ def prepare(words_file, scores_file):
         save_scores(scores_file, scores)
     return scores
 
-def predict(scores):
+def most_probable(scores):
     max = np.argmax(list(scores.values()))
     return list(scores.keys())[max]
 
+def predict(scores):
+    letters = dict()
+    for word in scores.keys():
+        unique_letters = []
+        for letter in word:
+            if letter not in unique_letters:
+                unique_letters.append(letter)
+                letters.setdefault(letter, 0)
+                letters[letter] += 1
+
+    letters = dict(sorted(letters.items(), key=lambda item: item[1], reverse=True))
+    for letter in letters:
+        new = select(scores, lambda word, _: letter in word)
+        if len(new) == 0:
+            break
+        if len(new) == 1:
+            return list(new.keys())[0]
+        scores = new
+    return most_probable(scores)
+
 def guess_word(scores):
+    prediction = most_probable(scores)
     for i in range(6):
+        scheme = input(f"My prediction is {prediction.upper()}\nWhat is the resulting scheme? ")
+        scores = prune_words(scores, prediction, scheme)
         if len(scores) == 1 or i == 5:
             print("My final answer is: " + list(scores.keys())[0])
             break
-        
         prediction = predict(scores)
-        scheme = input(f"My prediction is {prediction.upper()}\nWhat is the resulting scheme? ")
-        scores = prune_words(scores, prediction, scheme)
         
 def test(scores, percentage=0.2):
-    testset, _ = select(scores, lambda x, y: np.random.rand() < percentage)
+    #testset = select(scores, lambda x, y: np.random.rand() < percentage)
+    testset = scores
     guessed = 0
     attempts_mean = 0
+    def guess(start, length, lock):
+        nonlocal guessed, attempts_mean
+        local_guessed = 0
+        local_attempts = 0
+        for i in range(start, start+length):
+            secret = list(testset.keys())[i]
+            filtered = scores.copy()
+            prediction = most_probable(filtered)
+            attempt = 1
+            while attempt < 6:
+                scheme = get_scheme(secret, prediction)
+                filtered = prune_words(filtered, prediction, scheme)
+                if len(filtered) == 1:
+                    break
+                prediction = predict(filtered)
+                attempt += 1
 
-    for secret in testset:
-        attempt = 0
-        filtered = scores.copy()
-        while attempt < 6:
-            attempt += 1
-            prediction = predict(filtered)
-            scheme = get_scheme(secret, prediction)
-            filtered = prune_words(filtered, prediction, scheme)
             if len(filtered) == 1:
-                break
+                local_guessed += 1
+                local_attempts += attempt
 
-        if len(filtered) == 1:
-            guessed += 1
-            attempts_mean += attempt
-
+        with lock:
+            guessed += local_guessed
+            attempts_mean += local_attempts
+    
+    parallel(len(testset), guess)
     print(f"Guess percentage: {guessed/len(testset)*100:.2f}% - Attempts mean: {attempts_mean/len(testset):.2f}")
 
 if __name__ == "__main__":
