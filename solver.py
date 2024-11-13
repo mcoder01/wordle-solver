@@ -1,7 +1,8 @@
 import os
 import argparse
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import Lock, Value
+from process_pool import ProcessPool
+
+pool = ProcessPool()
 
 def occurrences(word):
     occ = dict()
@@ -28,52 +29,16 @@ def calculate_score(secret, word):
     occ = occurrences(get_scheme(secret, word))
     return sum([(int(mask)+1)*count for mask, count in occ.items()])
 
-def parallel(size, target, reduce=None):
-    workers = os.cpu_count()
-    with ProcessPoolExecutor() as executor:
-        index = Value('i')
-        lock = Lock()
-
-        global run
-        def run(): 
-            local_result = None
-            while True:
-                with lock:
-                    if index.value == size:
-                        break
-                    i = index.value
-                    index.value += 1
-                local_result = target(i, *local_result) if local_result else target(i)
-            return local_result
-
-        futures = []
-        for _ in range(workers):
-            futures.append(executor.submit(run))
-
-        if reduce:
-            while len(futures) > 1:
-                results = len(futures)
-                new_futures = []
-                for i in range(0, results-1, 2):
-                    new_futures.append(executor.submit(reduce, futures[i].result(), futures[i+1].result()))
-                if results%2 == 1:
-                    new_futures.append(futures[-1])
-                futures = new_futures
-            return futures[0].result()
-        
-        for future in futures:
-            future.result()
-
 def prune_words(words, prediction, scheme):
     return [word for word in words if get_scheme(word, prediction) == scheme]
 
 def evaluate_word(words, i, scores):
     scores.setdefault(words[i], 0)
-    for word in words[i+1:]:
-        scores.setdefault(word, 0)
-        score = calculate_score(words[i], word)
+    for j in range(i+1, len(words)):
+        scores.setdefault(words[j], 0)
+        score = calculate_score(words[i], words[j])
         scores[words[i]] += score
-        scores[word] += score
+        scores[words[j]] += score
     return scores
 
 def compute_scores(words):
@@ -91,7 +56,7 @@ def compute_scores(words):
                 scores[word] = scores1.get(word, 0)+scores2.get(word, 0)
         return (scores,)
 
-    return parallel(len(words), compute, combine)[0]
+    return pool.submit(len(words), compute, combine)[0]
 
 def prepare(words_file):
     with open(words_file, "r") as f:
@@ -103,7 +68,7 @@ def most_probable(scores):
 
 def predict(words):
     scores = compute_scores(words)
-    return max(scores.items(), key=lambda item: item[1])[0]
+    return most_probable(scores)
 
 def guess_word(scores):
     prediction = most_probable(scores)
@@ -139,7 +104,7 @@ def test(words):
         return res1[0]+res2[0], res1[1]+res2[1]
     
     total_words = len(words)
-    guessed, attempts = parallel(total_words, guess, reduce)
+    guessed, attempts = pool.submit(total_words, guess, reduce)
     print(f"Guess percentage: {guessed/total_words*100:.2f}% - Attempts mean: {attempts/total_words:.2f}")
 
 if __name__ == "__main__":
