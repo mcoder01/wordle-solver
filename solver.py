@@ -3,9 +3,6 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import Lock, Value
 
-import numpy as np
-import matplotlib.pyplot as plt
-
 def occurrences(word):
     occ = dict()
     for c in word:
@@ -28,102 +25,85 @@ def get_scheme(secret, word):
     return ''.join(scheme)
 
 def calculate_score(secret, word):
-    scheme = get_scheme(secret, word)
-    score = len(occurrences(word))/26.0
-    for mask in scheme:
-        if mask == '1' or mask == '2':
-            score += 1/5.0
-    return score
+    occ = occurrences(get_scheme(secret, word))
+    return sum([(int(mask)+1)*count for mask, count in occ.items()])
 
-def parallel(size, target):
+def parallel(size, target, reduce=None):
+    workers = os.cpu_count()
     with ProcessPoolExecutor() as executor:
-        num_threads = os.cpu_count()
-        N = size//num_threads
-        carry = size%num_threads
+        index = Value('i')
+        lock = Lock()
+
+        global run
+        def run(): 
+            local_result = None
+            while True:
+                with lock:
+                    if index.value == size:
+                        break
+                    i = index.value
+                    index.value += 1
+                local_result = target(i, *local_result) if local_result else target(i)
+            return local_result
 
         futures = []
-        for i in range(num_threads):
-            nloc = N+1 if i < carry else N
-            start = i*N + min(i, carry)
-            futures.append(executor.submit(target, start, nloc))
+        for _ in range(workers):
+            futures.append(executor.submit(run))
 
+        if reduce:
+            while len(futures) > 1:
+                results = len(futures)
+                new_futures = []
+                for i in range(0, results-1, 2):
+                    new_futures.append(executor.submit(reduce, futures[i].result(), futures[i+1].result()))
+                if results%2 == 1:
+                    new_futures.append(futures[-1])
+                futures = new_futures
+            return futures[0].result()
+        
         for future in futures:
             future.result()
 
+def prune_words(words, prediction, scheme):
+    return [word for word in words if get_scheme(word, prediction) == scheme]
+
+def evaluate_word(words, i, scores):
+    scores.setdefault(words[i], 0)
+    for word in words[i+1:]:
+        scores.setdefault(word, 0)
+        score = calculate_score(words[i], word)
+        scores[words[i]] += score
+        scores[word] += score
+    return scores
+
 def compute_scores(words):
-    scores = dict()
-    for i in range(len(words)):
-        scores.setdefault(words[i], 0)
-        for j in range(i+1, len(words)):
-            scores.setdefault(words[j], 0)
-            score = calculate_score(words[i], words[j])
-            scores[words[i]] += score
-            scores[words[j]] += score
-    return scores
+    global compute, combine
+    def compute(i, scores=None):
+        scores = dict() if scores is None else scores
+        return (evaluate_word(words, i, scores),)
 
-def load_scores(words, scores_filename):
-    scores = dict()
-    with open(scores_filename, "r") as f:
-        for word, value in zip(words, f.read().split(", ")):
-            scores[word] = float(value)
-    return scores
-    
-def save_scores(scores_filename, scores):
-    with open(scores_filename, "w") as f:
-        f.write(', '.join([str(value) for value in scores.values()]))
+    def combine(scores1, scores2):
+        scores1 = scores1[0]
+        scores2 = scores2[0]
+        scores = dict()
+        for word in words:
+            if word in scores1.keys() or word in scores2.keys():
+                scores[word] = scores1.get(word, 0)+scores2.get(word, 0)
+        return (scores,)
 
-def select(scores, function):
-    selected = dict()
-    for word, score in scores.items():
-        if function(word, score):
-            selected[word] = score
-    return selected
+    return parallel(len(words), compute, combine)[0]
 
-def plot(words, showAll=False, threshold=10000, window=1500):
-    _, axis = plt.subplots(1, 1)
-    x, y = select(words, lambda word: words[word] > threshold if not showAll else True)
-    axis.bar(x, y)
-    if not showAll:
-        axis.set(ylim=[threshold, threshold+window])
-    plt.show()
-
-def prune_words(scores, prediction, scheme):
-    return select(scores, lambda word, _: get_scheme(word, prediction) == scheme)
-
-def prepare(words_file, scores_file):
+def prepare(words_file):
     with open(words_file, "r") as f:
         words = f.read().splitlines()
-
-    if os.access(scores_file, os.O_RDONLY):
-        scores = load_scores(words, scores_file)
-    else:
-        scores = compute_scores(words)
-        save_scores(scores_file, scores)
-    return scores
+    return compute_scores(words)
 
 def most_probable(scores):
-    max = np.argmax(list(scores.values()))
-    return list(scores.keys())[max]
+    return max(scores.items(), key=lambda item: item[1])[0]
 
-def predict(scores):
-    letters = dict()
-    for word in scores.keys():
-        unique_letters = []
-        for letter in word:
-            if letter not in unique_letters:
-                unique_letters.append(letter)
-                letters.setdefault(letter, 0)
-                letters[letter] += 1
-
-    letters = dict(sorted(letters.items(), key=lambda item: item[1], reverse=True))
-    for letter in letters:
-        new = select(scores, lambda word, _: letter in word)
-        if len(new) == 0:
-            break
-        if len(new) == 1:
-            return list(new.keys())[0]
-        scores = new
-    return most_probable(scores)
+def predict(words):
+    scores = compute_scores(words)
+    return max(scores.items(), key=lambda item: item[1])[0]
 
 def guess_word(scores):
     prediction = most_probable(scores)
@@ -135,48 +115,40 @@ def guess_word(scores):
             break
         prediction = predict(scores)
         
-def test(scores, percentage=0.2):
-    testset = [key for key in scores.keys() if np.random.rand() < percentage]
-
-    lock = Lock()
-    guessed = Value('i', 0)
-    attempts_mean = Value('i', 0)
-
-    global guess
-    def guess(start, length):
-        local_guessed = 0
-        local_attempts = 0
-        for i in range(start, start+length):
-            secret = testset[i]
-            filtered = scores.copy()
-            prediction = most_probable(filtered)
-            attempt = 1
-            while attempt < 6:
-                scheme = get_scheme(secret, prediction)
-                filtered = prune_words(filtered, prediction, scheme)
-                if len(filtered) == 1:
-                    break
-                prediction = predict(filtered)
-                attempt += 1
-
+def test(words):
+    global guess, reduce
+    def guess(i, local_guessed=None, local_attempts=None):
+        secret = words[i]
+        filtered = words.copy()
+        prediction = "soare"
+        attempt = 1
+        while attempt < 6:
+            scheme = get_scheme(secret, prediction)
+            filtered = prune_words(filtered, prediction, scheme)
             if len(filtered) == 1:
-                local_guessed += 1
-                local_attempts += attempt
+                break
+            prediction = predict(filtered)
+            attempt += 1
 
-        with lock:
-            guessed.value += local_guessed
-            attempts_mean.value += local_attempts
+        if len(filtered) == 1:
+            local_guessed = local_guessed+1 if local_guessed else 1
+            local_attempts = local_attempts+attempt if local_attempts else attempt
+        return (local_guessed, local_attempts)
+
+    def reduce(res1, res2):
+        return res1[0]+res2[0], res1[1]+res2[1]
     
-    parallel(len(testset), guess)
-    print(f"Guess percentage: {guessed.value/len(testset)*100:.2f}% - Attempts mean: {attempts_mean.value/len(testset):.2f}")
+    total_words = len(words)
+    guessed, attempts = parallel(total_words, guess, reduce)
+    print(f"Guess percentage: {guessed/total_words*100:.2f}% - Attempts mean: {attempts/total_words:.2f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("-t", "--test", action="store_true", help="Test the solver on a random 20%% of the whole dictionary")
+    parser.add_argument("-t", "--test", action="store_true", help="Test the solver on the whole dictionary")
     args = parser.parse_args()
 
-    scores = prepare("words", "scores")
+    scores = prepare("words")
     if args.test:
-        test(scores)
+        test(list(scores.keys()))
     else:
         guess_word(scores)
